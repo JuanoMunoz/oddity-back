@@ -7,7 +7,7 @@ async function bootstrap() {
     bodyParser: false
   });
   app.enableCors({
-    origin: [process.env.BASE_URL_FRONTEND?.replace(/"/g, ""), "http://localhost:5173"].filter(Boolean),
+    origin: [process.env.BASE_URL_FRONTEND?.replace(/"/g, ""), "http://localhost:5173", "https://oddity-front.vercel.app"].filter(Boolean),
     credentials: true
   })
   app.useGlobalPipes(new ValidationPipe({
