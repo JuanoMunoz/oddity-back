@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1771797160376,
+      "tag": "0000_initial_db_config",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1771804808572,
+      "tag": "0001_add_auxiliar_tables_better_auth",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1771815538088,
+      "tag": "0002_add_role_name",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1771816017644,
+      "tag": "0003_delete_role_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1771853548478,
+      "tag": "0004_add_admin_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1771907860520,
+      "tag": "0005_add_mode",
+      "breakpoints": true
+    }
+  ]
+}
