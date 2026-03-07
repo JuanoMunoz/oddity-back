@@ -16,7 +16,7 @@ import { GroqModule } from './integrations/groq/groq.module';
     IaModelModule,
     CustomAgentModule,
     GeminiModule,
-    GroqModule
+    GroqModule,
   ],
 })
-export class AppModule { }
+export class AppModule {}

@@ -7,4 +7,4 @@ import { IaModelController } from './ia-model.controller';
   providers: [IaModelService],
   exports: [IaModelService],
 })
-export class IaModelModule { }
+export class IaModelModule {}

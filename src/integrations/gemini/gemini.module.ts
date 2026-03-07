@@ -5,10 +5,13 @@ import { GEMINI_AI, ia } from './gemini-config';
 
 @Module({
   controllers: [GeminiController],
-  providers: [GeminiService, {
-    provide: GEMINI_AI,
-    useValue: ia
-  }],
+  providers: [
+    GeminiService,
+    {
+      provide: GEMINI_AI,
+      useValue: ia,
+    },
+  ],
   exports: [GeminiService],
 })
-export class GeminiModule { }
+export class GeminiModule {}

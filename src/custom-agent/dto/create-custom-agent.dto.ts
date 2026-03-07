@@ -12,11 +12,15 @@ export class CreateCustomAgentDto {
 
   @IsString()
   @IsOptional()
-  mode?: "CHAT" | "FILE" | "IMAGE" | "VIDEO";
+  mode?: 'CHAT' | 'FILE' | 'IMAGE' | 'VIDEO';
 
   @IsNumber()
   @IsOptional()
   modelId?: number;
+
+  @IsString()
+  @IsOptional()
+  expectedOutput?: 'text' | 'excel' | 'pdf';
 
   @IsBoolean()
   @IsOptional()

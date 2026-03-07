@@ -8,16 +8,18 @@ import { eq, gte, sql } from 'drizzle-orm';
 
 @Injectable()
 export class OrganizationService {
-  constructor(
-    @Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>,
-  ) { }
+  constructor(@Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>) {}
 
   async create(createOrganizationDto: CreateOrganizationDto) {
-    const [newOrg] = await this.db.insert(schema.organization).values({
-      ...createOrganizationDto,
-      currentSpent: createOrganizationDto.currentSpent?.toString() || "0",
-      monthlySpendingLimit: createOrganizationDto.monthlySpendingLimit.toString(),
-    }).returning();
+    const [newOrg] = await this.db
+      .insert(schema.organization)
+      .values({
+        ...createOrganizationDto,
+        currentSpent: createOrganizationDto.currentSpent?.toString() || '0',
+        monthlySpendingLimit:
+          createOrganizationDto.monthlySpendingLimit.toString(),
+      })
+      .returning();
     return newOrg;
   }
 
@@ -26,7 +28,10 @@ export class OrganizationService {
   }
 
   async findOne(id: number) {
-    const [org] = await this.db.select().from(schema.organization).where(eq(schema.organization.id, id));
+    const [org] = await this.db
+      .select()
+      .from(schema.organization)
+      .where(eq(schema.organization.id, id));
     return org || null;
   }
 
@@ -34,7 +39,8 @@ export class OrganizationService {
     const updateData: any = { ...updateOrganizationDto };
 
     if (updateOrganizationDto.monthlySpendingLimit) {
-      updateData.monthlySpendingLimit = updateOrganizationDto.monthlySpendingLimit.toString();
+      updateData.monthlySpendingLimit =
+        updateOrganizationDto.monthlySpendingLimit.toString();
     }
     if (updateOrganizationDto.currentSpent) {
       updateData.currentSpent = updateOrganizationDto.currentSpent.toString();
@@ -49,7 +55,9 @@ export class OrganizationService {
   }
 
   async remove(id: number) {
-    await this.db.delete(schema.organization).where(eq(schema.organization.id, id));
+    await this.db
+      .delete(schema.organization)
+      .where(eq(schema.organization.id, id));
     return { id };
   }
 
@@ -100,12 +108,18 @@ export class OrganizationService {
       .from(schema.agentUsage)
       .where(
         sql`${schema.agentUsage.organizationId} = ${organizationId}
-            AND ${schema.agentUsage.createdAt} >= ${since.toISOString()}`
+            AND ${schema.agentUsage.createdAt} >= ${since.toISOString()}`,
       );
 
     const totalInputTokens = rows.reduce((s, r) => s + (r.inputTokens || 0), 0);
-    const totalOutputTokens = rows.reduce((s, r) => s + (r.outputTokens || 0), 0);
-    const totalCost = rows.reduce((s, r) => s + parseFloat(r.total?.toString() || '0'), 0);
+    const totalOutputTokens = rows.reduce(
+      (s, r) => s + (r.outputTokens || 0),
+      0,
+    );
+    const totalCost = rows.reduce(
+      (s, r) => s + parseFloat(r.total?.toString() || '0'),
+      0,
+    );
 
     return {
       period,

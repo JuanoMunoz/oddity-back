@@ -1,4 +1,12 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+} from '@nestjs/common';
 import { GroqService } from './groq.service';
 import { CreateGroqDto } from './dto/create-groq.dto';
 import { UpdateGroqDto } from './dto/update-groq.dto';

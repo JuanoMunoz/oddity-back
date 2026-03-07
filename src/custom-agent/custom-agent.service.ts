@@ -8,15 +8,16 @@ import { eq, and, desc } from 'drizzle-orm';
 
 @Injectable()
 export class CustomAgentService {
-  constructor(
-    @Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>,
-  ) { }
+  constructor(@Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>) {}
 
   async create(createCustomAgentDto: CreateCustomAgentDto) {
     const { modelId, ...agentData } = createCustomAgentDto;
-    const [newAgent] = await this.db.insert(schema.customAgent).values({
-      ...agentData,
-    }).returning();
+    const [newAgent] = await this.db
+      .insert(schema.customAgent)
+      .values({
+        ...agentData,
+      })
+      .returning();
 
     if (modelId) {
       await this.db.insert(schema.customAgentModel).values({
@@ -24,6 +25,7 @@ export class CustomAgentService {
         modelId,
         priority: 1,
         isActive: true,
+        expectedOutput: createCustomAgentDto.expectedOutput || 'text',
       });
     }
 
@@ -35,7 +37,10 @@ export class CustomAgentService {
   }
 
   async findOne(id: number) {
-    const [agent] = await this.db.select().from(schema.customAgent).where(eq(schema.customAgent.id, id));
+    const [agent] = await this.db
+      .select()
+      .from(schema.customAgent)
+      .where(eq(schema.customAgent.id, id));
     return agent || null;
   }
 
@@ -54,7 +59,8 @@ export class CustomAgentService {
     }
 
     if (modelId) {
-      await this.db.update(schema.customAgentModel)
+      await this.db
+        .update(schema.customAgentModel)
         .set({ isActive: false })
         .where(eq(schema.customAgentModel.customAgentId, id));
 
@@ -63,6 +69,7 @@ export class CustomAgentService {
         modelId,
         priority: 1,
         isActive: true,
+        expectedOutput: (updateCustomAgentDto as any).expectedOutput || 'text',
       });
     }
 
@@ -70,7 +77,9 @@ export class CustomAgentService {
   }
 
   async remove(id: number) {
-    await this.db.delete(schema.customAgent).where(eq(schema.customAgent.id, id));
+    await this.db
+      .delete(schema.customAgent)
+      .where(eq(schema.customAgent.id, id));
     return { id };
   }
 
@@ -81,8 +90,8 @@ export class CustomAgentService {
       .where(
         and(
           eq(schema.customAgentModel.customAgentId, customAgentId),
-          eq(schema.customAgentModel.isActive, true)
-        )
+          eq(schema.customAgentModel.isActive, true),
+        ),
       )
       .orderBy(desc(schema.customAgentModel.priority))
       .limit(1);
@@ -111,14 +120,17 @@ export class CustomAgentService {
     outputTokens: number;
     total: number;
   }) {
-    return this.db.insert(schema.agentUsage).values({
-      userId: data.userId,
-      agentId: data.agentId,
-      organizationId: data.organizationId,
-      modelId: data.modelId,
-      inputTokens: data.inputTokens,
-      outputTokens: data.outputTokens,
-      total: data.total.toFixed(8),
-    }).returning();
+    return this.db
+      .insert(schema.agentUsage)
+      .values({
+        userId: data.userId,
+        agentId: data.agentId,
+        organizationId: data.organizationId,
+        modelId: data.modelId,
+        inputTokens: data.inputTokens,
+        outputTokens: data.outputTokens,
+        total: data.total.toFixed(8),
+      })
+      .returning();
   }
 }

@@ -1,11 +1,19 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+} from '@nestjs/common';
 import { IaModelService } from './ia-model.service';
 import { CreateIaModelDto } from './dto/create-ia-model.dto';
 import { UpdateIaModelDto } from './dto/update-ia-model.dto';
 
 @Controller('/api/ia-model')
 export class IaModelController {
-  constructor(private readonly iaModelService: IaModelService) { }
+  constructor(private readonly iaModelService: IaModelService) {}
 
   @Post()
   create(@Body() createIaModelDto: CreateIaModelDto) {

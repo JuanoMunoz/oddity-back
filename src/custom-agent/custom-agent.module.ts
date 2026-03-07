@@ -11,4 +11,4 @@ import { OrganizationModule } from '@/organization/organization.module';
   controllers: [CustomAgentController],
   providers: [CustomAgentService],
 })
-export class CustomAgentModule { }
+export class CustomAgentModule {}

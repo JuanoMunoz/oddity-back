@@ -8,16 +8,17 @@ import { eq } from 'drizzle-orm';
 
 @Injectable()
 export class IaModelService {
-  constructor(
-    @Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>,
-  ) { }
+  constructor(@Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>) {}
 
   async create(createIaModelDto: CreateIaModelDto) {
-    const [newModel] = await this.db.insert(schema.iaModel).values({
-      ...createIaModelDto,
-      pricePerInputToken: createIaModelDto.pricePerInputToken.toString(),
-      pricePerOutputToken: createIaModelDto.pricePerOutputToken.toString(),
-    }).returning();
+    const [newModel] = await this.db
+      .insert(schema.iaModel)
+      .values({
+        ...createIaModelDto,
+        pricePerInputToken: createIaModelDto.pricePerInputToken.toString(),
+        pricePerOutputToken: createIaModelDto.pricePerOutputToken.toString(),
+      })
+      .returning();
     return newModel;
   }
 
@@ -26,7 +27,10 @@ export class IaModelService {
   }
 
   async findOne(id: number) {
-    const [model] = await this.db.select().from(schema.iaModel).where(eq(schema.iaModel.id, id));
+    const [model] = await this.db
+      .select()
+      .from(schema.iaModel)
+      .where(eq(schema.iaModel.id, id));
     return model || null;
   }
 
@@ -34,10 +38,12 @@ export class IaModelService {
     const updateData: any = { ...updateIaModelDto };
 
     if (updateIaModelDto.pricePerInputToken !== undefined) {
-      updateData.pricePerInputToken = updateIaModelDto.pricePerInputToken.toString();
+      updateData.pricePerInputToken =
+        updateIaModelDto.pricePerInputToken.toString();
     }
     if (updateIaModelDto.pricePerOutputToken !== undefined) {
-      updateData.pricePerOutputToken = updateIaModelDto.pricePerOutputToken.toString();
+      updateData.pricePerOutputToken =
+        updateIaModelDto.pricePerOutputToken.toString();
     }
 
     const [updatedModel] = await this.db

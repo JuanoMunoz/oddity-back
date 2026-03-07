@@ -5,12 +5,12 @@ export const DRIZZLE = 'DRIZZLE';
 
 @Global()
 @Module({
-    providers: [
-        {
-            provide: DRIZZLE,
-            useValue: db,
-        },
-    ],
-    exports: [DRIZZLE],
+  providers: [
+    {
+      provide: DRIZZLE,
+      useValue: db,
+    },
+  ],
+  exports: [DRIZZLE],
 })
-export class DbModule { }
+export class DbModule {}
