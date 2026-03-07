@@ -14,7 +14,8 @@ async function bootstrap() {
 
   // Trust proxy for Render/Vercel/Cloudflare (to handle secure cookies correctly)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (app as any).set('trust proxy', true);
+  const server = (app as any).getHttpAdapter().getInstance();
+  server.set('trust proxy', 1);
 
   const origins = [
     process.env.BASE_URL_FRONTEND?.replace(/"/g, ''),

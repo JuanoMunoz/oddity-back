@@ -37,11 +37,13 @@ export const auth = betterAuth({
   trustHost: true,
 
   cookies: {
+    // Explicitly set for cross-domain auth when in production (Render uses proxy)
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: process.env.NODE_ENV === 'production' || !!process.env.BETTER_AUTH_URL?.startsWith('https'),
   },
   advanced: {
-    // Disabled as frontend and backend are on different domains (vercel.app vs onrender.com)
+    // Disabled as frontend and backend are on different base domains (vercel.app vs onrender.com)
+    // This allows the browser to accept the cookie even though the domains don't match.
     crossSubDomainCookies: {
       enabled: false,
     },
