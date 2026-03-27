@@ -173,7 +173,15 @@ export class GeminiService {
         const isRetryable = status === 503 || status === 429 || status === 500;
 
         if (isRetryable && attempt < MAX_RETRIES) {
-          const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          let delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          // Attempt to extract recommended delay from Gemini's RetryInfo if present
+          if (status === 429 && err?.details) {
+            const retryInfo = err.details.find((d: any) => d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+            if (retryInfo?.retryDelay) {
+              const seconds = parseFloat(retryInfo.retryDelay.replace('s', ''));
+              if (!isNaN(seconds)) delay = Math.max(delay, (seconds * 1000) + 1000);
+            }
+          }
           if (attempt >= 2 && modelToUse === this.model) {
             modelToUse = FALLBACK_MODEL;
           }
@@ -193,6 +201,7 @@ export class GeminiService {
     files: Express.Multer.File[],
     prompt: string,
     systemInstruction?: string,
+    onProgress?: (message: string) => void,
   ): Promise<{ text: string }> {
     const sysInst = systemInstruction || '';
 
@@ -220,6 +229,9 @@ export class GeminiService {
         const label = `chunk ${chunkIdx}/${totalChunks} (rows ${i + 1}-${Math.min(i + EXCEL_CHUNK_SIZE, rows.length)} of ${rows.length})`;
 
         console.log(`[Gemini] Processing ${label}`);
+        if (onProgress) {
+          onProgress(`Procesando chunk ${chunkIdx}/${totalChunks} (${Math.min(i + EXCEL_CHUNK_SIZE, rows.length)}/${rows.length} filas)...`);
+        }
 
         const chunkResult = await this.processChunk(
           chunkCsv,

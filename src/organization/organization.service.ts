@@ -8,7 +8,7 @@ import { eq, gte, sql } from 'drizzle-orm';
 
 @Injectable()
 export class OrganizationService {
-  constructor(@Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>) {}
+  constructor(@Inject(DRIZZLE) private db: PostgresJsDatabase<typeof schema>) { }
 
   async create(createOrganizationDto: CreateOrganizationDto) {
     const [newOrg] = await this.db
@@ -33,6 +33,21 @@ export class OrganizationService {
       .from(schema.organization)
       .where(eq(schema.organization.id, id));
     return org || null;
+  }
+
+  async findByAccessToken(token: string) {
+    const [org] = await this.db
+      .select()
+      .from(schema.organization)
+      .where(eq(schema.organization.accessToken, token));
+    return org || null;
+  }
+
+  async linkUserToOrganization(userId: string, organizationId: number) {
+    await this.db
+      .update(schema.user)
+      .set({ organizationId })
+      .where(eq(schema.user.id, userId));
   }
 
   async update(id: number, updateOrganizationDto: UpdateOrganizationDto) {
