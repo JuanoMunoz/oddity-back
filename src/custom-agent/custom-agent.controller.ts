@@ -326,43 +326,36 @@ export class CustomAgentController {
     // Unique jobId for checkpoint tracking
     const jobId = crypto.randomBytes(8).toString('hex');
 
-    // ── Set streaming response headers ──
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="result.xlsx"');
-
+    // ── Set SSE headers ──
+    res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('X-Pipeline-JobId', jobId);
+    res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    const excelFile = excelFiles[0]; // primary file
+    const excelFile = excelFiles[0];
 
-    // ── Pipe streaming pipeline directly into HTTP response ──
+    // ── Execute pipeline (it now pushes SSE events into the stream) ──
     const pipelineStream = this.geminiService.streamExcelPipeline(
       excelFile,
       finalPrompt,
       agent.systemPrompt || '',
       jobId,
-      (msg) => console.log(`[StreamCSV] jobId=${jobId} progress: ${msg}`),
+      (msg) => console.log(`[StreamSSE] jobId=${jobId} progress: ${msg}`),
     );
 
-    // On stream error → abort response
     pipelineStream.on('error', (err) => {
-      console.error(`[StreamCSV] jobId=${jobId} pipeline error:`, err.message);
-      if (!res.headersSent) {
-        res.status(500).json({ message: 'Pipeline failed: ' + err.message });
-      } else {
-        res.end();
-      }
+      console.error(`[StreamSSE] jobId=${jobId} error:`, err.message);
+      res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+      res.end();
     });
 
     pipelineStream.on('end', async () => {
-      console.log(`[StreamCSV] jobId=${jobId} stream complete.`);
+      console.log(`[StreamSSE] jobId=${jobId} processing finished.`);
 
-      // Usage tracking (non-fatal, best-effort)
+      // Usage tracking
       try {
         const inputTokens = Math.ceil((prompt.length + (agent.systemPrompt?.length || 0)) / 4);
-        // Output tokens unknown at this point — use prompt as proxy
-        const outputTokens = inputTokens * 10; // conservative estimate
+        const outputTokens = inputTokens * 10;
         const priceIn = parseFloat(model.pricePerInputToken?.toString() || '0');
         const priceOut = parseFloat(model.pricePerOutputToken?.toString() || '0');
         const totalCost = inputTokens * priceIn + outputTokens * priceOut;
@@ -372,13 +365,14 @@ export class CustomAgentController {
         });
         await this.organizationService.incrementSpent(agent.organizationId, totalCost);
       } catch (trackErr) {
-        console.error('[StreamCSV] Usage tracking failed:', trackErr);
+        console.error('[StreamSSE] Usage tracking failed:', trackErr);
       }
     });
 
-    // Pipe: pipelineStream → HTTP response (with backpressure)
+    // Pipe the SSE text stream to response
     pipelineStream.pipe(res);
   }
+
 
   @Get('download/:jobId')
   async downloadResult(@Param('jobId') jobId: string, @Res() res: any) {
@@ -389,11 +383,8 @@ export class CustomAgentController {
       throw new NotFoundException('El archivo ya no existe o el jobId es inválido.');
     }
 
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="resultado_${jobId}.xlsx"`);
-
-    const stream = fsSync.createReadStream(filePath);
-    stream.pipe(res);
+    res.download(filePath, `auxiliar_contable_procesado_${jobId}.xlsx`);
   }
 }
+
 

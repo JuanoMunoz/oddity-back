@@ -508,28 +508,25 @@ export class GeminiService {
         startMs: Date.now(),
       };
 
-      // ── Persistent Storage Logic ──
+      // ── Persistent Storage Strategy ──
+      // To guarantee a valid .xlsx (ZIP), we write directly to disk using ExcelJS's file-based writer.
+      // We do NOT stream binary while processing to avoid ZIP corruption due to backpressure/network glitches.
+      // Instead, we stream PROGRESS via the PassThrough, and COMLETE at the end.
       const resultsDir = path.join(process.cwd(), 'results');
       if (!fsSync.existsSync(resultsDir)) {
         fsSync.mkdirSync(resultsDir, { recursive: true });
       }
       const filePath = path.join(resultsDir, `${jobId}.xlsx`);
-      const fileStream = fsSync.createWriteStream(filePath);
 
-      // We use a broadcaster PassThrough to fork the Excel stream: 
-      // 1. To the file on disk (permanent storage)
-      // 2. To the 'output' PassThrough (immediate HTTP download)
-      const broadcaster = new PassThrough();
-      broadcaster.pipe(fileStream);
-      broadcaster.pipe(output);
-
-      // ── Create Excel Streaming Writer ──
       const writer = new ExcelJS.stream.xlsx.WorkbookWriter({
-        stream: broadcaster,
-        useStyles: false,
-        useSharedStrings: false,
+        filename: filePath,
+        useStyles: true,
+        useSharedStrings: true, // Crucial for repeated accounting data
       });
 
+      const sendEvent = (type: 'progress' | 'complete' | 'error', message: string, extra = {}) => {
+        output.push(`data: ${JSON.stringify({ type, message, ...extra })}\n\n`);
+      };
 
       try {
         const resumeFrom = await readCheckpoint(jobId);
@@ -542,78 +539,54 @@ export class GeminiService {
         for await (const job of this.streamExcelChunks(file.buffer, resumeFrom)) {
           metrics.totalChunks++;
 
-          // Lazy initialise worksheet with headers
           if (!worksheet) {
             worksheet = writer.addWorksheet('Result');
             worksheet.addRow(job.headers);
             console.log(`[Pipeline] Worksheet initialized with ${job.headers.length} headers`);
           }
 
-          if (onProgress) {
-            onProgress(
-              `chunk ${job.chunkIdx} | rows ${job.startRowNum}–${job.startRowNum + job.rows.length - 1}`,
-            );
-          }
+          const progressMsg = `chunk ${job.chunkIdx} | procesando filas ${job.startRowNum}–${job.startRowNum + job.rows.length - 1}`;
+          if (onProgress) onProgress(progressMsg);
+          sendEvent('progress', progressMsg, { chunk: job.chunkIdx, totalRows: metrics.totalRows });
 
           const outputRows = await this.processChunk(job, prompt, systemInstruction, metrics);
           metrics.totalRows += outputRows.length;
 
-          // Write rows to Excel stream
           for (const row of outputRows) {
             worksheet.addRow(row);
           }
 
-          // Commit current chunk to prevent extreme memory build-up in the writer internal buffer
-          // (though workbook writer usually handles this, periodic worksheet.commit isn't available
-          // in the stream writer, it commits on writer.commit())
-          // Actually, we just keep adding; WorkbookWriter streams parts.
-
-          // Persist checkpoint
           await writeCheckpoint(jobId, job.chunkIdx);
-
-          // Rate-limit pause
           await new Promise(r => setTimeout(r, CHUNK_INTER_DELAY_MS));
         }
 
-        if (worksheet) {
-          console.log(`[Pipeline] Finalizing Excel workbook; total rows: ${metrics.totalRows}`);
-        } else {
-          console.warn(`[Pipeline] No data processed. Creating empty sheet.`);
-          writer.addWorksheet('Empty').addRow(['No se encontraron datos para procesar']);
+        if (!worksheet) {
+          writer.addWorksheet('Empty').addRow(['No se encontraron datos']);
         }
 
-        await writer.commit();
-
-        // Wait for file stream to finish to ensure Zip structure is intact on disk
-        await new Promise<void>((resolve) => {
-          if (fileStream.writableFinished) resolve();
-          else fileStream.once('finish', resolve);
-        });
+        console.log(`[Pipeline] Finalizing Excel on disk: ${filePath}`);
+        await writer.commit(); // Finishes the ZIP and closes the file
 
         await clearCheckpoint(jobId);
-
         const elapsedMs = Date.now() - metrics.startMs;
-        console.log(
-          `[Pipeline] DONE jobId=${jobId} | ` +
-          `rows=${metrics.totalRows} chunks=${metrics.totalChunks} ` +
-          `elapsed=${elapsedMs}ms | Saved: ${filePath}`,
-        );
+        console.log(`[Pipeline] DONE jobId=${jobId} | rows=${metrics.totalRows} | elapsed=${elapsedMs}ms`);
 
+        // Notify client we are done
+        sendEvent('complete', 'Procesamiento completado con éxito', { jobId, totalRows: metrics.totalRows });
+        output.push(null); // Close SSE stream
 
-        // The writer.commit() closes the internal stream, which closes 'output'.
       } catch (err: any) {
         console.error(`[Pipeline] FATAL jobId=${jobId}:`, err?.message ?? err);
-        // Clean up partial corrupted file
-        fileStream.destroy();
         await fs.unlink(filePath).catch(() => { });
+        sendEvent('error', err?.message || 'Error fatal en la tubería');
         output.destroy(err instanceof Error ? err : new Error(String(err)));
       }
+
 
     })();
 
     return output;
   }
-
 
   // ───────────────────────────────────────────────────────────
   // PUBLIC: analyzeFilesChunked
@@ -630,6 +603,8 @@ export class GeminiService {
     systemInstruction?: string,
     onProgress?: (message: string) => void,
   ): Promise<{ text: string }> {
+
+
     const sysInst = systemInstruction || '';
     const excelFiles = files.filter(f => this.isExcelFile(f));
     const otherFiles = files.filter(f => !this.isExcelFile(f));
