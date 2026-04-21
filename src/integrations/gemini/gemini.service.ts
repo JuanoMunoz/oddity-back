@@ -190,7 +190,7 @@ export class GeminiService {
     buffer: Buffer,
     resumeFromChunk = 0,
   ): AsyncGenerator<ChunkJob> {
-    const tmpPath = path.join(os.tmpdir(), `excel-stream-${Date.now()}.xlsx`);
+    const tmpPath = path.join(os.tmpdir(), `excel-in-${Date.now()}.xlsx`);
     await fs.writeFile(tmpPath, buffer);
 
     try {
@@ -200,32 +200,41 @@ export class GeminiService {
       let chunkBuffer: string[][] = [];
       let chunkIdx = 0;
       let dataRowNum = 0;
-      let chunkStartRow = 1;
+      let chunkStartRow = 2; // Data usually starts at row 2
       let chunkSize = FALLBACK_CHUNK_SIZE;
       let chunkSizeComputed = false;
+      let headersFound = false;
       const sampleAccumulator: string[][] = [];
 
       for await (const worksheet of workbook) {
+        console.log(`[Pipeline] Accessing worksheet...`);
+
+
+
         for await (const row of worksheet) {
+          if (!row || !row.values || !Array.isArray(row.values)) continue;
+
           const rawValues = (row.values as any[]).slice(1);
 
-          // ── Row 1 → headers ──
-          if (row.number === 1) {
-            headers = rawValues.map((v: any) =>
+          // ── Header detection logic ──
+          if (!headersFound) {
+            const possibleHeaders = rawValues.map((v: any) =>
               v === null || v === undefined ? '' : String(v),
             );
+
+            // Heuristic: first row with non-empty content is the header
+            if (possibleHeaders.some(h => h.trim().length > 0)) {
+              headers = possibleHeaders;
+              headersFound = true;
+              chunkStartRow = row.number + 1;
+              console.log(`[Pipeline] Headers detected on row ${row.number}: [${headers.slice(0, 3).join(', ')}...]`);
+              continue;
+            }
+
             continue;
           }
 
-          // ── Safety: no header row found yet ──
-          if (headers.length === 0) {
-            headers = rawValues.map((v: any) =>
-              v === null || v === undefined ? '' : String(v),
-            );
-            continue;
-          }
-
-          // ── Normalise data row: pad/trim to header width ──
+          // ── Data row ──
           dataRowNum++;
           const normalized: string[] = Array.from(
             { length: headers.length },
@@ -236,22 +245,23 @@ export class GeminiService {
           );
           chunkBuffer.push(normalized);
 
-          // ── Dynamic chunk size from first sample batch ──
+
+          // ── Dynamic chunk size ──
           if (!chunkSizeComputed) {
             sampleAccumulator.push(normalized);
             if (sampleAccumulator.length >= 20) {
               chunkSize = computeChunkSize(sampleAccumulator, CHUNK_MAX_OUTPUT_TOKENS);
               chunkSizeComputed = true;
-              console.log(`[Gemini] Dynamic chunk size: ${chunkSize} rows`);
+              console.log(`[Pipeline] Dynamic chunk size calculated: ${chunkSize} rows`);
             }
           }
 
-          if (chunkBuffer.length === chunkSize) {
+          if (chunkBuffer.length >= chunkSize) {
             chunkIdx++;
 
-            // ── Skip already-processed chunks (resume support) ──
             if (chunkIdx <= resumeFromChunk) {
-              chunkStartRow = dataRowNum + 1;
+              console.log(`[Pipeline] Skipping chunk ${chunkIdx} (resume)`);
+              chunkStartRow = row.number + 1;
               chunkBuffer = [];
               continue;
             }
@@ -263,13 +273,13 @@ export class GeminiService {
               startRowNum: chunkStartRow,
               inputChecksum: rowChecksum(chunkBuffer),
             };
-            chunkStartRow = dataRowNum + 1;
+            chunkStartRow = row.number + 1;
             chunkBuffer = [];
           }
         }
       }
 
-      // ── Flush last partial chunk ──
+      // ── Final partial chunk ──
       if (chunkBuffer.length > 0) {
         chunkIdx++;
         if (chunkIdx > resumeFromChunk) {
@@ -286,6 +296,7 @@ export class GeminiService {
       await fs.unlink(tmpPath).catch(() => { });
     }
   }
+
 
   // ───────────────────────────────────────────────────────────
   // LAYER 2 — Safe CSV serializer
@@ -368,13 +379,25 @@ export class GeminiService {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const response = await this.ai.models.generateContent({
+        const result = await this.ai.models.generateContent({
           model: modelToUse,
           contents,
           config: { ...this.chunkConfig, systemInstruction },
         });
 
-        const raw = (response.text || '').trim();
+        // Robust text extraction for @google/genai SDK
+        let raw = '';
+        if (typeof (result as any).text === 'string') {
+          raw = (result as any).text;
+        } else if ((result as any).candidates?.[0]?.content?.parts?.[0]?.text) {
+          raw = (result as any).candidates[0].content.parts[0].text;
+        } else if (typeof (result as any).text === 'function') {
+          raw = (result as any).text();
+        }
+
+        raw = (raw || '').trim();
+        console.log(`[Pipeline] LLM Response length: ${raw.length} chars | First 50 chars: ${raw.substring(0, 50).replace(/\n/g, ' ')}...`);
+
 
         // ── Guard: oversized response → corruption ──
         if (Buffer.byteLength(raw, 'utf8') > MAX_RAW_RESPONSE_BYTES) {
@@ -485,14 +508,13 @@ export class GeminiService {
         startMs: Date.now(),
       };
 
-      // Drain before we start writing if needed
-      const writeChunk = (data: string): Promise<void> =>
-        new Promise((resolve, reject) => {
-          const ok = output.push(data);
-          if (ok !== false) return resolve();
-          output.once('drain', resolve);
-          output.once('error', reject);
-        });
+      // ── Create Excel Streaming Writer ──
+      // This pipes directly into the output PassThrough
+      const writer = new ExcelJS.stream.xlsx.WorkbookWriter({
+        stream: output,
+        useStyles: false,
+        useSharedStrings: false,
+      });
 
       try {
         const resumeFrom = await readCheckpoint(jobId);
@@ -500,14 +522,16 @@ export class GeminiService {
           console.log(`[Pipeline] Resuming jobId=${jobId} from chunk ${resumeFrom}`);
         }
 
-        let headersWritten = false;
+        let worksheet: ExcelJS.Worksheet | null = null;
 
         for await (const job of this.streamExcelChunks(file.buffer, resumeFrom)) {
           metrics.totalChunks++;
 
-          if (!headersWritten) {
-            await writeChunk(job.headers.join(';') + '\n');
-            headersWritten = true;
+          // Lazy initialise worksheet with headers
+          if (!worksheet) {
+            worksheet = writer.addWorksheet('Result');
+            worksheet.addRow(job.headers);
+            console.log(`[Pipeline] Worksheet initialized with ${job.headers.length} headers`);
           }
 
           if (onProgress) {
@@ -519,17 +543,31 @@ export class GeminiService {
           const outputRows = await this.processChunk(job, prompt, systemInstruction, metrics);
           metrics.totalRows += outputRows.length;
 
+          // Write rows to Excel stream
           for (const row of outputRows) {
-            await writeChunk(row.join(';') + '\n');
+            worksheet.addRow(row);
           }
 
-          // Persist checkpoint — survives restart
+          // Commit current chunk to prevent extreme memory build-up in the writer internal buffer
+          // (though workbook writer usually handles this, periodic worksheet.commit isn't available
+          // in the stream writer, it commits on writer.commit())
+          // Actually, we just keep adding; WorkbookWriter streams parts.
+
+          // Persist checkpoint
           await writeCheckpoint(jobId, job.chunkIdx);
 
-          // Rate-limit pause between chunks
+          // Rate-limit pause
           await new Promise(r => setTimeout(r, CHUNK_INTER_DELAY_MS));
         }
 
+        if (worksheet) {
+          console.log(`[Pipeline] Finalizing Excel workbook; total rows: ${metrics.totalRows}`);
+        } else {
+          console.warn(`[Pipeline] No data processed. Creating empty sheet.`);
+          writer.addWorksheet('Empty').addRow(['No se encontraron datos para procesar']);
+        }
+
+        await writer.commit();
         await clearCheckpoint(jobId);
 
         const elapsedMs = Date.now() - metrics.startMs;
@@ -537,11 +575,10 @@ export class GeminiService {
         console.log(
           `[Pipeline] DONE jobId=${jobId} | ` +
           `rows=${metrics.totalRows} chunks=${metrics.totalChunks} ` +
-          `retried=${metrics.retriedChunks} failed=${metrics.failedChunks} ` +
-          `elapsed=${elapsedMs}ms rowsPerSec=${rowsPerSec.toFixed(1)}`,
+          `elapsed=${elapsedMs}ms`,
         );
 
-        output.push(null); // signal EOF to the consumer
+        // The writer.commit() closes the internal stream, which closes 'output'.
       } catch (err: any) {
         console.error(`[Pipeline] FATAL jobId=${jobId}:`, err?.message ?? err);
         output.destroy(err instanceof Error ? err : new Error(String(err)));
@@ -550,6 +587,7 @@ export class GeminiService {
 
     return output;
   }
+
 
   // ───────────────────────────────────────────────────────────
   // PUBLIC: analyzeFilesChunked

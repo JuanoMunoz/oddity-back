@@ -210,8 +210,8 @@ export class CustomAgentController {
             // ── Redirect client to the streaming download endpoint ──
             sendEvent({
               type: 'redirect',
-              message: 'Large Excel detected — use /api/custom-agent/use/stream-csv for download.',
-              endpoint: '/api/custom-agent/use/stream-csv',
+              message: 'Large Excel detected — use /api/custom-agent/use/stream-excel for download.',
+              endpoint: '/api/custom-agent/use/stream-excel',
             });
             return res.end();
           } else {
@@ -283,9 +283,10 @@ export class CustomAgentController {
   // No file is accumulated in memory.
   // ─────────────────────────────────────────────
 
-  @Post('use/stream-csv')
+  @Post('use/stream-excel')
   @UseInterceptors(FilesInterceptor('files', 10, UPLOAD_OPTIONS))
-  async useAgentStreamCsv(
+  async useAgentStreamExcel(
+
     @Body() body: any,
     @UploadedFiles() files: Express.Multer.File[] | undefined,
     @Res() res: any,
@@ -323,8 +324,9 @@ export class CustomAgentController {
     const jobId = crypto.randomBytes(8).toString('hex');
 
     // ── Set streaming response headers ──
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="result.csv"');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="result.xlsx"');
+
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('X-Pipeline-JobId', jobId);
     res.flushHeaders();
