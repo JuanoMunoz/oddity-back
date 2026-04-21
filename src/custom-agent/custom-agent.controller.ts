@@ -332,12 +332,11 @@ export class CustomAgentController {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    const excelFile = excelFiles[0];
-
     // ── Execute pipeline (it now pushes SSE events into the stream) ──
     const pipelineStream = this.geminiService.streamExcelPipeline(
-      excelFile,
+      excelFiles,
       finalPrompt,
+
       agent.systemPrompt || '',
       jobId,
       (msg) => console.log(`[StreamSSE] jobId=${jobId} progress: ${msg}`),

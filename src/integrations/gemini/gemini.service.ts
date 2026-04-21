@@ -490,12 +490,13 @@ export class GeminiService {
   // The caller must pipe it; when it ends, processing is done.
   // ───────────────────────────────────────────────────────────
   streamExcelPipeline(
-    file: Express.Multer.File,
+    files: Express.Multer.File[],
     prompt: string,
     systemInstruction: string,
     jobId: string,
     onProgress?: (msg: string) => void,
   ): PassThrough {
+
     const output = new PassThrough();
 
     // Kick off async work without blocking the caller
@@ -535,45 +536,51 @@ export class GeminiService {
         }
 
         let worksheet: ExcelJS.Worksheet | null = null;
+        let filesProcessed = 0;
 
-        for await (const job of this.streamExcelChunks(file.buffer, resumeFrom)) {
-          metrics.totalChunks++;
+        for (const file of files) {
+          filesProcessed++;
+          const filePrefix = files.length > 1 ? `[Archivo ${filesProcessed}/${files.length}] ` : '';
+          console.log(`[Pipeline] Starting file: ${file.originalname} (${filesProcessed}/${files.length})`);
 
-          if (!worksheet) {
-            worksheet = writer.addWorksheet('Result');
-            worksheet.addRow(job.headers);
-            console.log(`[Pipeline] Worksheet initialized with ${job.headers.length} headers`);
+          for await (const job of this.streamExcelChunks(file.buffer, resumeFrom)) {
+            metrics.totalChunks++;
+
+            if (!worksheet) {
+              worksheet = writer.addWorksheet('Result');
+              worksheet.addRow(job.headers);
+              console.log(`[Pipeline] Worksheet initialized with ${job.headers.length} headers`);
+            }
+
+            const progressMsg = `${filePrefix}chunk ${job.chunkIdx} | filas ${job.startRowNum}–${job.startRowNum + job.rows.length - 1}`;
+            if (onProgress) onProgress(progressMsg);
+            sendEvent('progress', progressMsg, { chunk: job.chunkIdx, totalRows: metrics.totalRows });
+
+            const outputRows = await this.processChunk(job, prompt, systemInstruction, metrics);
+            metrics.totalRows += outputRows.length;
+
+            for (const row of outputRows) {
+              worksheet.addRow(row);
+            }
+
+            await writeCheckpoint(jobId, job.chunkIdx);
+            await new Promise(r => setTimeout(r, CHUNK_INTER_DELAY_MS));
           }
-
-          const progressMsg = `chunk ${job.chunkIdx} | procesando filas ${job.startRowNum}–${job.startRowNum + job.rows.length - 1}`;
-          if (onProgress) onProgress(progressMsg);
-          sendEvent('progress', progressMsg, { chunk: job.chunkIdx, totalRows: metrics.totalRows });
-
-          const outputRows = await this.processChunk(job, prompt, systemInstruction, metrics);
-          metrics.totalRows += outputRows.length;
-
-          for (const row of outputRows) {
-            worksheet.addRow(row);
-          }
-
-          await writeCheckpoint(jobId, job.chunkIdx);
-          await new Promise(r => setTimeout(r, CHUNK_INTER_DELAY_MS));
         }
 
         if (!worksheet) {
-          writer.addWorksheet('Empty').addRow(['No se encontraron datos']);
+          writer.addWorksheet('Empty').addRow(['No se encontraron datos en los archivos subidos']);
         }
 
         console.log(`[Pipeline] Finalizing Excel on disk: ${filePath}`);
-        await writer.commit(); // Finishes the ZIP and closes the file
+        await writer.commit();
 
         await clearCheckpoint(jobId);
         const elapsedMs = Date.now() - metrics.startMs;
-        console.log(`[Pipeline] DONE jobId=${jobId} | rows=${metrics.totalRows} | elapsed=${elapsedMs}ms`);
+        console.log(`[Pipeline] DONE jobId=${jobId} | files=${files.length} | rows=${metrics.totalRows} | elapsed=${elapsedMs}ms`);
 
-        // Notify client we are done
         sendEvent('complete', 'Procesamiento completado con éxito', { jobId, totalRows: metrics.totalRows });
-        output.push(null); // Close SSE stream
+        output.push(null);
 
       } catch (err: any) {
         console.error(`[Pipeline] FATAL jobId=${jobId}:`, err?.message ?? err);
@@ -581,6 +588,7 @@ export class GeminiService {
         sendEvent('error', err?.message || 'Error fatal en la tubería');
         output.destroy(err instanceof Error ? err : new Error(String(err)));
       }
+
 
 
     })();
