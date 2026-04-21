@@ -508,13 +508,28 @@ export class GeminiService {
         startMs: Date.now(),
       };
 
+      // ── Persistent Storage Logic ──
+      const resultsDir = path.join(process.cwd(), 'results');
+      if (!fsSync.existsSync(resultsDir)) {
+        fsSync.mkdirSync(resultsDir, { recursive: true });
+      }
+      const filePath = path.join(resultsDir, `${jobId}.xlsx`);
+      const fileStream = fsSync.createWriteStream(filePath);
+
+      // We use a broadcaster PassThrough to fork the Excel stream: 
+      // 1. To the file on disk (permanent storage)
+      // 2. To the 'output' PassThrough (immediate HTTP download)
+      const broadcaster = new PassThrough();
+      broadcaster.pipe(fileStream);
+      broadcaster.pipe(output);
+
       // ── Create Excel Streaming Writer ──
-      // This pipes directly into the output PassThrough
       const writer = new ExcelJS.stream.xlsx.WorkbookWriter({
-        stream: output,
+        stream: broadcaster,
         useStyles: false,
         useSharedStrings: false,
       });
+
 
       try {
         const resumeFrom = await readCheckpoint(jobId);
@@ -568,21 +583,32 @@ export class GeminiService {
         }
 
         await writer.commit();
+
+        // Wait for file stream to finish to ensure Zip structure is intact on disk
+        await new Promise<void>((resolve) => {
+          if (fileStream.writableFinished) resolve();
+          else fileStream.once('finish', resolve);
+        });
+
         await clearCheckpoint(jobId);
 
         const elapsedMs = Date.now() - metrics.startMs;
-        const rowsPerSec = metrics.totalRows / Math.max(elapsedMs / 1000, 0.001);
         console.log(
           `[Pipeline] DONE jobId=${jobId} | ` +
           `rows=${metrics.totalRows} chunks=${metrics.totalChunks} ` +
-          `elapsed=${elapsedMs}ms`,
+          `elapsed=${elapsedMs}ms | Saved: ${filePath}`,
         );
+
 
         // The writer.commit() closes the internal stream, which closes 'output'.
       } catch (err: any) {
         console.error(`[Pipeline] FATAL jobId=${jobId}:`, err?.message ?? err);
+        // Clean up partial corrupted file
+        fileStream.destroy();
+        await fs.unlink(filePath).catch(() => { });
         output.destroy(err instanceof Error ? err : new Error(String(err)));
       }
+
     })();
 
     return output;

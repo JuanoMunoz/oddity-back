@@ -12,6 +12,7 @@ import {
   Res,
   HttpCode,
   HttpStatus,
+  NotFoundException,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
@@ -23,8 +24,10 @@ import { ChatGeminiDto } from '@/integrations/gemini/dto/chat-gemini-dto';
 import { IaModelService } from '@/ia-model/ia-model.service';
 import { OrganizationService } from '@/organization/organization.service';
 import * as fs from 'fs';
+import * as fsSync from 'fs';
 import * as fsAsync from 'fs/promises';
 import * as crypto from 'crypto';
+import * as path from 'path';
 
 // ─── Shared multer options for file uploads ──────────────────
 const UPLOAD_OPTIONS = {
@@ -376,4 +379,21 @@ export class CustomAgentController {
     // Pipe: pipelineStream → HTTP response (with backpressure)
     pipelineStream.pipe(res);
   }
+
+  @Get('download/:jobId')
+  async downloadResult(@Param('jobId') jobId: string, @Res() res: any) {
+    const resultsDir = path.join(process.cwd(), 'results');
+    const filePath = path.join(resultsDir, `${jobId}.xlsx`);
+
+    if (!fsSync.existsSync(filePath)) {
+      throw new NotFoundException('El archivo ya no existe o el jobId es inválido.');
+    }
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="resultado_${jobId}.xlsx"`);
+
+    const stream = fsSync.createReadStream(filePath);
+    stream.pipe(res);
+  }
 }
+
