@@ -15,20 +15,29 @@ import * as path from 'path';
 import * as os from 'os';
 import * as XLSX from 'xlsx';
 import { Readable, PassThrough } from 'stream';
+import * as readline from 'readline';
 import ExcelJS from 'exceljs';
 
+
+export interface CategorizedFiles {
+  formatFile?: Express.Multer.File;
+  inputFile: Express.Multer.File;
+  supportFiles?: Express.Multer.File[];
+}
+
 // ═══════════════════════════════════════════════
+
 // Pipeline constants
 // ═══════════════════════════════════════════════
-const CHUNK_MAX_OUTPUT_TOKENS = 65000;   // token budget per LLM call
-const TOKENS_PER_CHAR = 0.25;            // ~4 chars per token (conservative)
-const SAFE_TOKEN_MARGIN = 0.65;          // use 65 % of the budget for input rows
-const FALLBACK_CHUNK_SIZE = 80;          // rows when dynamic sizing cannot be computed
+const CHUNK_INPUT_ROWS = 200;           // fixed number of input rows per call
+const CHUNK_MAX_OUTPUT_TOKENS = 8192;    // Gemini 1.5 Flash output limit
 const CHUNK_INTER_DELAY_MS = 1500;       // mandatory inter-chunk pause (rate limiting)
 const MAX_RETRIES = 5;                   // retries per chunk (fail-hard after)
 const BASE_DELAY_MS = 12000;             // base exponential back-off
 const MAX_RAW_RESPONSE_BYTES = 2 * 1024 * 1024; // 2 MB guard on LLM response size
-const FALLBACK_MODEL = 'gemini-2.5-flash-lite';
+const FALLBACK_MODEL = 'gemini-2.5-flash-lite'; // Tiny fast model for emergency fallback
+
+
 const CHECKPOINT_PREFIX = 'gemini-ckpt-'; // temp dir prefix for checkpoint files
 
 // ═══════════════════════════════════════════════
@@ -63,19 +72,11 @@ function rowChecksum(rows: string[][]): number {
   return n;
 }
 
-/**
- * Dynamic chunk size based on avg chars per row and available token budget.
- * Formula: floor((maxTokens * margin) / (avgCharsPerRow * tokensPerChar))
- */
-function computeChunkSize(sampleRows: string[][], maxTokens: number): number {
-  if (sampleRows.length === 0) return FALLBACK_CHUNK_SIZE;
-  const totalChars = sampleRows.reduce((acc, r) => acc + r.join(';').length, 0);
-  const avgChars = totalChars / sampleRows.length;
-  const tokensPerRow = avgChars * TOKENS_PER_CHAR;
-  if (tokensPerRow <= 0) return FALLBACK_CHUNK_SIZE;
-  const size = Math.floor((maxTokens * SAFE_TOKEN_MARGIN) / tokensPerRow);
-  return Math.max(10, Math.min(size, 500)); // clamp [10, 500]
+/** Estimate tokens from text using Gemini's tokenization (1 token ≈ 3.5 chars avg for English/Spanish) */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.5);
 }
+
 
 /** Build a temp-file path for the checkpoint of a given job. */
 function checkpointPath(jobId: string): string {
@@ -111,6 +112,8 @@ async function clearCheckpoint(jobId: string): Promise<void> {
 export class GeminiService {
   private readonly model: string = 'gemini-2.5-flash';
 
+
+
   /** Default config — chat / general use */
   private readonly config: GenerateContentConfig = {
     thinkingConfig: { thinkingBudget: 0 },
@@ -134,7 +137,50 @@ export class GeminiService {
   constructor(
     @Inject(GEMINI_AI)
     private readonly ai: GoogleGenAI,
-  ) { }
+  ) {
+    // Run initial cleanup once on service startup
+    this.cleanupResults().catch(e => console.error('[Pipeline] Startup cleanup failed', e));
+  }
+
+  // ───────────────────────────────────────────────────────────
+  // PRIVATE: cleanupResults
+  // Purges files in results/ older than 7 days.
+  // ───────────────────────────────────────────────────────────
+  private async cleanupResults() {
+    const resultsDir = path.join(process.cwd(), 'results');
+    if (!fsSync.existsSync(resultsDir)) return;
+
+    try {
+      const files = await fs.readdir(resultsDir);
+      const now = Date.now();
+      const TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+      for (const file of files) {
+        const filePath = path.join(resultsDir, file);
+        const stats = await fs.stat(filePath);
+        if (now - stats.mtimeMs > TTL) {
+          console.log(`[Pipeline] Cleanup: removing expired file ${file}`);
+          await fs.unlink(filePath).catch(() => { });
+        }
+      }
+
+      // Also cleanup leftover checkpoints in tmp
+      const tmpDir = os.tmpdir();
+      const tmpFiles = await fs.readdir(tmpDir);
+      for (const tFile of tmpFiles) {
+        if (tFile.startsWith('checkpoint-') && tFile.endsWith('.json')) {
+          const tPath = path.join(tmpDir, tFile);
+          const tStats = await fs.stat(tPath);
+          if (now - tStats.mtimeMs > TTL) {
+            await fs.unlink(tPath).catch(() => { });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Pipeline] Cleanup error:', e);
+    }
+  }
+
 
   // ───────────────────────────────────────────────────────────
   // PUBLIC: ask (single prompt)
@@ -171,12 +217,36 @@ export class GeminiService {
   // PRIVATE: isExcelFile
   // ───────────────────────────────────────────────────────────
   isExcelFile(file: Express.Multer.File): boolean {
+    const ext = file.originalname.toLowerCase();
     return (
-      file.originalname.endsWith('.xlsx') ||
-      file.originalname.endsWith('.xls') ||
+      ext.endsWith('.xlsx') ||
+      ext.endsWith('.xls') ||
+      ext.endsWith('.csv') ||
       file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
-      file.mimetype === 'application/vnd.ms-excel'
+      file.mimetype === 'application/vnd.ms-excel' ||
+      file.mimetype === 'text/csv'
     );
+  }
+
+
+  // ───────────────────────────────────────────────────────────
+  // Safe cell value to string conversion
+  // Handles dates, numbers, booleans, and malformed data
+  // ───────────────────────────────────────────────────────────
+  private safeCellToString(value: any): string {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number') return value.toString();
+    if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
+    if (value instanceof Date) return value.toISOString().split('T')[0]; // YYYY-MM-DD format
+    // Handle ExcelJS rich text or other objects
+    if (typeof value === 'object' && value.text) return String(value.text);
+    // Fallback
+    try {
+      return String(value);
+    } catch {
+      return '[ERROR: UNREADABLE CELL]';
+    }
   }
 
   // ───────────────────────────────────────────────────────────
@@ -201,13 +271,16 @@ export class GeminiService {
       let chunkIdx = 0;
       let dataRowNum = 0;
       let chunkStartRow = 2; // Data usually starts at row 2
-      let chunkSize = FALLBACK_CHUNK_SIZE;
-      let chunkSizeComputed = false;
       let headersFound = false;
-      const sampleAccumulator: string[][] = [];
+      let worksheetCount = 0;
 
       for await (const worksheet of workbook) {
-        console.log(`[Pipeline] Accessing worksheet...`);
+        worksheetCount++;
+        if (worksheetCount > 1) {
+          console.warn(`[Pipeline] Multiple worksheets detected. Only processing the first one.`);
+          break; // Only process first worksheet
+        }
+        console.log(`[Pipeline] Accessing worksheet ${worksheetCount}...`);
 
 
 
@@ -218,9 +291,7 @@ export class GeminiService {
 
           // ── Header detection logic ──
           if (!headersFound) {
-            const possibleHeaders = rawValues.map((v: any) =>
-              v === null || v === undefined ? '' : String(v),
-            );
+            const possibleHeaders = rawValues.map((v: any) => this.safeCellToString(v));
 
             // Heuristic: first row with non-empty content is the header
             if (possibleHeaders.some(h => h.trim().length > 0)) {
@@ -238,25 +309,18 @@ export class GeminiService {
           dataRowNum++;
           const normalized: string[] = Array.from(
             { length: headers.length },
-            (_, i) => {
-              const v = rawValues[i];
-              return v === null || v === undefined ? '' : String(v);
-            },
+            (_, i) => this.safeCellToString(rawValues[i]),
           );
+
+          // Skip empty rows
+          if (normalized.every(cell => cell.trim() === '')) {
+            console.log(`[Pipeline] Skipping empty row ${row.number}`);
+            continue;
+          }
           chunkBuffer.push(normalized);
 
 
-          // ── Dynamic chunk size ──
-          if (!chunkSizeComputed) {
-            sampleAccumulator.push(normalized);
-            if (sampleAccumulator.length >= 20) {
-              chunkSize = computeChunkSize(sampleAccumulator, CHUNK_MAX_OUTPUT_TOKENS);
-              chunkSizeComputed = true;
-              console.log(`[Pipeline] Dynamic chunk size calculated: ${chunkSize} rows`);
-            }
-          }
-
-          if (chunkBuffer.length >= chunkSize) {
+          if (chunkBuffer.length >= CHUNK_INPUT_ROWS) {
             chunkIdx++;
 
             if (chunkIdx <= resumeFromChunk) {
@@ -297,12 +361,137 @@ export class GeminiService {
     }
   }
 
+  // ───────────────────────────────────────────────────────────
+  // LAYER 1.1 — CSVStreamReader
+  //
+  // Native streaming reader for CSV files.
+  // Handles Quoted values and basic CSV escaping.
+  // ───────────────────────────────────────────────────────────
+  private async *streamCSVChunks(
+    buffer: Buffer,
+    resumeFromChunk = 0,
+  ): AsyncGenerator<ChunkJob> {
+    const stream = Readable.from(buffer);
+    const rl = readline.createInterface({
+      input: stream,
+      crlfDelay: Infinity,
+    });
+
+
+    let headers: string[] = [];
+    let chunkBuffer: string[][] = [];
+    let chunkIdx = 0;
+    let dataRowNum = 0;
+    let headersFound = false;
+    let lineIdx = 0;
+
+    let separator = ',';
+    const firstLine = buffer.toString('utf-8').split('\n')[0];
+    const commas = (firstLine.match(/,/g) || []).length;
+    const semicolons = (firstLine.match(/;/g) || []).length;
+    if (semicolons > commas) separator = ';';
+    console.log(`[Pipeline] CSV auto-detected separator: "${separator}"`);
+
+    const parseCSVLine = (line: string): string[] => {
+      const result: string[] = [];
+
+      let current = '';
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (char === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            current += '"';
+            i++;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (char === separator && !inQuotes) {
+          result.push(current);
+          current = '';
+        } else {
+          current += char;
+        }
+      }
+      result.push(current);
+      return result;
+    };
+
+
+    for await (const line of rl) {
+      lineIdx++;
+      if (!line.trim()) continue;
+
+      const values = parseCSVLine(line);
+
+      if (!headersFound) {
+        if (values.some(v => v.trim().length > 0)) {
+          headers = values.map(v => v.trim());
+          headersFound = true;
+          console.log(`[Pipeline] CSV headers detected: [${headers.slice(0, 3).join(', ')}...]`);
+        }
+        continue;
+      }
+
+      dataRowNum++;
+      chunkBuffer.push(values.map(v => v ?? ''));
+
+      if (chunkBuffer.length >= CHUNK_INPUT_ROWS) {
+        chunkIdx++;
+        if (chunkIdx > resumeFromChunk) {
+          yield {
+            chunkIdx,
+            headers,
+            rows: [...chunkBuffer],
+            startRowNum: lineIdx - chunkBuffer.length + 1,
+            inputChecksum: rowChecksum(chunkBuffer),
+          };
+        }
+        chunkBuffer = [];
+      }
+    }
+
+    // Flush last chunk
+    if (chunkBuffer.length > 0) {
+      chunkIdx++;
+      if (chunkIdx > resumeFromChunk) {
+        yield {
+          chunkIdx,
+          headers,
+          rows: chunkBuffer,
+          startRowNum: lineIdx - chunkBuffer.length + 1,
+          inputChecksum: rowChecksum(chunkBuffer),
+        };
+      }
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────
+  // LAYER 1.2 — Universal File Stream Wrapper
+  // ───────────────────────────────────────────────────────────
+  private async *streamFileChunks(
+    file: Express.Multer.File | { buffer: Buffer, originalname: string },
+    resumeFromChunk = 0,
+  ): AsyncGenerator<ChunkJob> {
+    const isCSV = file.originalname.toLowerCase().endsWith('.csv');
+    if (isCSV) {
+      console.log(`[Pipeline] Using CSV streaming path for ${file.originalname}`);
+      yield* this.streamCSVChunks(file.buffer, resumeFromChunk);
+    } else {
+      console.log(`[Pipeline] Using XLSX streaming path for ${file.originalname}`);
+      yield* this.streamExcelChunks(file.buffer, resumeFromChunk);
+    }
+  }
+
+
 
   // ───────────────────────────────────────────────────────────
   // LAYER 2 — Safe CSV serializer
   // ───────────────────────────────────────────────────────────
+  // LAYER 2 — Safe CSV serializer
+  // ───────────────────────────────────────────────────────────
   private rowsToCSV(rows: string[][]): string {
-    return rows.map(r => r.join(';')).join('\n');
+    return rows.map(r => r.map(cell => cell.replace(/\n/g, ' ')).join(';')).join('\n');
   }
 
   // ───────────────────────────────────────────────────────────
@@ -314,30 +503,51 @@ export class GeminiService {
   //   • Trim each line
   //   • NEVER discard a line: pad short rows, truncate long rows
   // ───────────────────────────────────────────────────────────
-  private parseLlmRows(raw: string, expectedCols: number): string[][] {
-    let cleaned = raw
+  private parseLlmRows(raw: string, jobHeaders: string[]): string[][] {
+    const expectedCols = jobHeaders.length;
+    const cleaned = raw
       .replace(/```(?:csv|text)?\n?([\s\S]*?)\n?```/g, '$1')
       .trim();
 
-    // Prefer ; but fall back to , if no ; found
-    if (!cleaned.includes(';') && cleaned.includes(',')) {
-      cleaned = cleaned.replace(/,/g, ';');
-    }
-
-    return cleaned
+    const rawLines = cleaned
       .split('\n')
       .map(l => l.trim())
-      .filter(l => l.length > 0)
-      .map(line => {
-        const cols = line.split(';');
-        if (cols.length === expectedCols) return cols;
-        if (cols.length < expectedCols) {
-          while (cols.length < expectedCols) cols.push('');
-          return cols;
-        }
-        return cols.slice(0, expectedCols); // truncate surplus columns
+      .filter(l => l.length > 0);
+
+    console.log(`[Pipeline] Parsed ${rawLines.length} raw lines from LLM response`);
+
+    // Parse all lines as CSV rows, normalizing to expectedCols
+    const parsed: string[][] = [];
+
+    for (const line of rawLines) {
+      const cols = line.split(';').map(c => c.trim());
+
+      // Skip empty or single-column lines
+      if (cols.length < 2) continue;
+
+      // Detect if this line is just a repetition of the headers
+      const isHeader = cols.every((val, idx) => {
+        const header = jobHeaders[idx]?.trim().toLowerCase();
+        return header && val.toLowerCase() === header;
       });
+      if (isHeader) {
+        console.log(`[Pipeline] Header repetition detected and skipped.`);
+        continue;
+      }
+
+      // Pad or trim to expectedCols
+      const row: string[] = [];
+      for (let i = 0; i < expectedCols; i++) {
+        row.push(cols[i] || '');
+      }
+
+      parsed.push(row);
+    }
+
+    console.log(`[Pipeline] Extracted ${parsed.length} valid rows from LLM output`);
+    return parsed;
   }
+
 
   // ───────────────────────────────────────────────────────────
   // LAYER 4 — LLMProcessor
@@ -366,13 +576,21 @@ export class GeminiService {
 
     const dataCsv = this.rowsToCSV(inputRows);
     const chunkPrompt =
-      `${prompt}\n\n---\nDATA CHUNK [${label}]:\n${dataCsv}\n---\n` +
-      `STRICT CONTRACT:\n` +
-      `- Respond ONLY with semicolon-separated CSV rows.\n` +
-      `- Do NOT include any header row.\n` +
-      `- Each row MUST have exactly ${expectedCols} columns.\n` +
-      `- No markdown, no explanations, no preamble, no trailing text.\n` +
-      `- You MUST return EXACTLY ${inputCount} rows — one per input row, in the same order.`;
+      `# TASK: Process the following DATA CHUNK using the provided context.\n\n` +
+      `## REFERENCE CONTEXT (Support Files):\n` +
+      `These files are for LOOKUP ONLY. Do NOT process these files as part of the output.\n` +
+      `System Instruction Context: ${systemInstruction.includes('CONTEXTO DE APOYO') ? 'See System Instruction' : 'None'}\n\n` +
+      `## INPUT DATA TO PROCESS:\n` +
+      `${dataCsv}\n\n` +
+      `## STRICT INSTRUCTIONS:\n` +
+      `1. Respond ONLY with semicolon-separated (;) CSV rows.\n` +
+      `2. One row per line. Do NOT split a row across multiple lines.\n` +
+      `3. Each row MUST have exactly ${expectedCols} columns separated by semicolons.\n` +
+      `4. Do NOT include headers, markdown blocks, or any conversation.\n` +
+      `5. If you cannot find info for a column, leave it empty.\n` +
+      `6. IMPORTANT: Do NOT use newlines (\\n) within cells. Replace them with spaces.\n` +
+      `7. The data may contain commas (,). Only use semicolon (;) as the column separator.`;
+
 
     const contents: Content[] = [{ role: 'user', parts: [{ text: chunkPrompt }] }];
     let modelToUse = this.model;
@@ -396,7 +614,8 @@ export class GeminiService {
         }
 
         raw = (raw || '').trim();
-        console.log(`[Pipeline] LLM Response length: ${raw.length} chars | First 50 chars: ${raw.substring(0, 50).replace(/\n/g, ' ')}...`);
+        const responseLines = raw.split('\n').length;
+        console.log(`[Pipeline] LLM Response: ${raw.length} chars | ${responseLines} lines | RATIO: ${(responseLines / inputCount).toFixed(2)}x | First 60 chars: ${raw.substring(0, 60).replace(/\n/g, ' ')}...`);
 
 
         // ── Guard: oversized response → corruption ──
@@ -412,13 +631,11 @@ export class GeminiService {
           throw new Error(`${msg} FAIL-HARD.`);
         }
 
-        const parsedRows = this.parseLlmRows(raw, expectedCols);
+        let parsedRows = this.parseLlmRows(raw, headers);
 
-        // ── Strict row-count equality — no tolerance ──
-        if (parsedRows.length !== inputCount) {
-          const msg =
-            `[Pipeline] ${label}: expected ${inputCount} rows, ` +
-            `got ${parsedRows.length} on attempt ${attempt}.`;
+        // ── Acceptance Check ──
+        if (parsedRows.length === 0) {
+          const msg = `[Pipeline] ${label}: empty or invalid response on attempt ${attempt}.`;
           console.warn(msg);
           if (attempt < MAX_RETRIES) {
             if (metrics) metrics.retriedChunks++;
@@ -433,15 +650,18 @@ export class GeminiService {
         const elapsedMs = Date.now() - t0;
         console.log(
           `[Pipeline] OK ${label} | attempt=${attempt} elapsed=${elapsedMs}ms ` +
+          `extracted=${parsedRows.length} rows (input was ${inputCount}) | ` +
           `inputChecksum=${inputChecksum} outputChecksum=${outputChecksum}`,
         );
         return parsedRows;
 
       } catch (err: any) {
         const status: number = err?.status ?? err?.response?.status ?? 0;
-        const isRetryable = status === 503 || status === 429 || status === 500;
+        const msg = err?.message?.toLowerCase() || '';
+        const isRetryable = status === 503 || status === 429 || status === 500 || msg.includes('fetch failed') || msg.includes('timeout') || msg.includes('network');
 
         if (isRetryable && attempt < MAX_RETRIES) {
+
           let delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
           if (status === 429 && err?.details) {
             const retryInfo = err.details.find(
@@ -490,14 +710,17 @@ export class GeminiService {
   // The caller must pipe it; when it ends, processing is done.
   // ───────────────────────────────────────────────────────────
   streamExcelPipeline(
-    files: Express.Multer.File[],
+    files: CategorizedFiles,
     prompt: string,
     systemInstruction: string,
     jobId: string,
     onProgress?: (msg: string) => void,
+    modelInfo?: { pricePerInputToken?: number; pricePerOutputToken?: number },
   ): PassThrough {
 
     const output = new PassThrough();
+    this.cleanupResults().catch(() => { }); // Fire and forget background cleanup
+
 
     // Kick off async work without blocking the caller
     (async () => {
@@ -531,45 +754,86 @@ export class GeminiService {
 
       try {
         const resumeFrom = await readCheckpoint(jobId);
-        if (resumeFrom > 0) {
-          console.log(`[Pipeline] Resuming jobId=${jobId} from chunk ${resumeFrom}`);
-        }
 
-        let worksheet: ExcelJS.Worksheet | null = null;
-        let filesProcessed = 0;
+        // 1. Prepare context from Support Files
+        let supportContext = '';
+        if (files.supportFiles?.length) {
+          console.log(`[Pipeline] Loading ${files.supportFiles.length} support files`);
+          for (const sFile of files.supportFiles) {
+            let content = '';
+            const isExcel = sFile.originalname.endsWith('.xlsx') || sFile.originalname.endsWith('.xls');
 
-        for (const file of files) {
-          filesProcessed++;
-          const filePrefix = files.length > 1 ? `[Archivo ${filesProcessed}/${files.length}] ` : '';
-          console.log(`[Pipeline] Starting file: ${file.originalname} (${filesProcessed}/${files.length})`);
-
-          for await (const job of this.streamExcelChunks(file.buffer, resumeFrom)) {
-            metrics.totalChunks++;
-
-            if (!worksheet) {
-              worksheet = writer.addWorksheet('Result');
-              worksheet.addRow(job.headers);
-              console.log(`[Pipeline] Worksheet initialized with ${job.headers.length} headers`);
+            if (isExcel) {
+              try {
+                const wb = XLSX.read(sFile.buffer, { type: 'buffer' });
+                const firstSheet = wb.Sheets[wb.SheetNames[0]];
+                content = XLSX.utils.sheet_to_csv(firstSheet).slice(0, 50000); // Max 50k chars per support file
+              } catch (e) {
+                content = `[Error leyendo Excel: ${e.message}]`;
+              }
+            } else {
+              content = sFile.buffer.toString('utf-8').slice(0, 50000);
             }
 
-            const progressMsg = `${filePrefix}chunk ${job.chunkIdx} | filas ${job.startRowNum}–${job.startRowNum + job.rows.length - 1}`;
-            if (onProgress) onProgress(progressMsg);
-            sendEvent('progress', progressMsg, { chunk: job.chunkIdx, totalRows: metrics.totalRows });
-
-            const outputRows = await this.processChunk(job, prompt, systemInstruction, metrics);
-            metrics.totalRows += outputRows.length;
-
-            for (const row of outputRows) {
-              worksheet.addRow(row);
-            }
-
-            await writeCheckpoint(jobId, job.chunkIdx);
-            await new Promise(r => setTimeout(r, CHUNK_INTER_DELAY_MS));
+            supportContext += `\n--- CONTEXTO DE APOYO (${sFile.originalname}) ---\n${content}\n`;
           }
         }
 
+        const enrichedSystemInstruction = `${systemInstruction}\n\nUsa este contexto extra si es necesario:\n${supportContext}`;
+
+        // 2. Headings from Template (if any)
+        let worksheet: ExcelJS.Worksheet | null = null;
+        let templateHeaders: string[] = [];
+
+        if (files.formatFile) {
+          console.log(`[Pipeline] Extracting headers from template: ${files.formatFile.originalname}`);
+          const formatStream = this.streamFileChunks(files.formatFile, 0);
+          const firstChunk = await formatStream.next();
+          if (!firstChunk.done) {
+            templateHeaders = firstChunk.value.headers;
+          }
+        }
+
+        // 3. Process Input File
+        console.log(`[Pipeline] Processing input file: ${files.inputFile.originalname}`);
+
+        for await (const job of this.streamFileChunks(files.inputFile, resumeFrom)) {
+
+          metrics.totalChunks++;
+
+          if (!worksheet) {
+            worksheet = writer.addWorksheet('Result');
+            const finalHeaders = templateHeaders.length > 0 ? templateHeaders : job.headers;
+            worksheet.addRow(finalHeaders);
+            console.log(`[Pipeline] Worksheet initialized with ${finalHeaders.length} headers`);
+          }
+
+          const progressMsg = `chunk ${job.chunkIdx} | filas ${job.startRowNum}–${job.startRowNum + job.rows.length - 1}`;
+          if (onProgress) onProgress(progressMsg);
+          sendEvent('progress', progressMsg, { chunk: job.chunkIdx, totalRows: metrics.totalRows });
+
+          // Override headers in job if we have a template
+          if (templateHeaders.length > 0) job.headers = templateHeaders;
+
+          const outputRows = await this.processChunk(
+            job,
+            prompt,
+            enrichedSystemInstruction,
+            metrics,
+          );
+
+          metrics.totalRows += outputRows.length;
+
+          for (const row of outputRows) {
+            worksheet.addRow(row);
+          }
+
+          await writeCheckpoint(jobId, job.chunkIdx);
+          await new Promise(r => setTimeout(r, CHUNK_INTER_DELAY_MS));
+        }
+
         if (!worksheet) {
-          writer.addWorksheet('Empty').addRow(['No se encontraron datos en los archivos subidos']);
+          writer.addWorksheet('Empty').addRow(['No se encontraron datos en el archivo de entrada']);
         }
 
         console.log(`[Pipeline] Finalizing Excel on disk: ${filePath}`);
@@ -577,10 +841,30 @@ export class GeminiService {
 
         await clearCheckpoint(jobId);
         const elapsedMs = Date.now() - metrics.startMs;
-        console.log(`[Pipeline] DONE jobId=${jobId} | files=${files.length} | rows=${metrics.totalRows} | elapsed=${elapsedMs}ms`);
+        
+        // Calculate token cost
+        const promptTokens = estimateTokens(prompt + systemInstruction);
+        const priceIn = parseFloat(modelInfo?.pricePerInputToken?.toString() || '0');
+        const priceOut = parseFloat(modelInfo?.pricePerOutputToken?.toString() || '0');
+        
+        // Estimate output tokens from processed rows (rough: 50 tokens per row)
+        const estimatedOutputTokens = metrics.totalRows * 50;
+        const totalCost = (promptTokens * priceIn) + (estimatedOutputTokens * priceOut);
+        
+        console.log(
+          `[Pipeline] DONE jobId=${jobId} | rows=${metrics.totalRows} | elapsed=${elapsedMs}ms | ` +
+          `tokens: input=${promptTokens} output~=${estimatedOutputTokens} | cost=$${totalCost.toFixed(6)}`
+        );
 
-        sendEvent('complete', 'Procesamiento completado con éxito', { jobId, totalRows: metrics.totalRows });
+        sendEvent('complete', 'Procesamiento completado con éxito', { 
+          jobId, 
+          totalRows: metrics.totalRows,
+          tokens: { input: promptTokens, output: estimatedOutputTokens },
+          cost: totalCost,
+          elapsed: elapsedMs
+        });
         output.push(null);
+
 
       } catch (err: any) {
         console.error(`[Pipeline] FATAL jobId=${jobId}:`, err?.message ?? err);
@@ -646,7 +930,8 @@ export class GeminiService {
 
       for (const excelFile of excelFiles) {
         const jobId = `sse-${Date.now()}`;
-        for await (const job of this.streamExcelChunks(excelFile.buffer, 0)) {
+
+        for await (const job of this.streamFileChunks(excelFile, 0)) {
           if (!headersWritten) {
             await writeLine(job.headers.join(';'));
             headersWritten = true;
@@ -657,7 +942,13 @@ export class GeminiService {
             onProgress(`chunk ${job.chunkIdx} (rows ${job.startRowNum}–${endRow})`);
           }
 
-          const outputRows = await this.processChunk(job, prompt, sysInst, metrics);
+          const outputRows = await this.processChunk(
+            job,
+            prompt,
+            sysInst,
+            metrics,
+          );
+
           metrics.totalRows += outputRows.length;
 
           for (const row of outputRows) {

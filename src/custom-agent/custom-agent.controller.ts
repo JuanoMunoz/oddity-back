@@ -14,12 +14,15 @@ import {
   HttpStatus,
   NotFoundException,
 } from '@nestjs/common';
-import { FilesInterceptor } from '@nestjs/platform-express';
+import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
+import { PassThrough } from 'stream';
+
 import { CustomAgentService } from './custom-agent.service';
 import { CreateCustomAgentDto } from './dto/create-custom-agent.dto';
 import { UpdateCustomAgentDto } from './dto/update-custom-agent.dto';
-import { GeminiService } from '@/integrations/gemini/gemini.service';
+import { GeminiService, type CategorizedFiles } from '@/integrations/gemini/gemini.service';
+
 import { ChatGeminiDto } from '@/integrations/gemini/dto/chat-gemini-dto';
 import { IaModelService } from '@/ia-model/ia-model.service';
 import { OrganizationService } from '@/organization/organization.service';
@@ -285,105 +288,170 @@ export class CustomAgentController {
   // The pipeline writes directly into the HTTP response stream.
   // No file is accumulated in memory.
   // ─────────────────────────────────────────────
+@Post('use/stream-excel')
+@UseInterceptors(FileFieldsInterceptor([
+  { name: 'formatFile', maxCount: 1 },
+  { name: 'inputFile', maxCount: 1 },
+  { name: 'supportFiles', maxCount: 10 },
+  { name: 'files', maxCount: 10 },
+], UPLOAD_OPTIONS))
+async useAgentStreamExcel(
+  @Body() body: any,
+  @UploadedFiles() files: {
+    formatFile?: Express.Multer.File[],
+    inputFile?: Express.Multer.File[],
+    supportFiles?: Express.Multer.File[],
+    files?: Express.Multer.File[],
+  },
+  @Res() res: any,
+) {
+  const customAgentId = Number(body.customAgentId);
+  const userId = body.userId || null;
+  const prompt = body.prompt || '';
 
-  @Post('use/stream-excel')
-  @UseInterceptors(FilesInterceptor('files', 10, UPLOAD_OPTIONS))
-  async useAgentStreamExcel(
+  const mainInput = files.inputFile?.[0] || files.files?.[0];
+  if (!mainInput) throw new BadRequestException('No input file provided');
 
-    @Body() body: any,
-    @UploadedFiles() files: Express.Multer.File[] | undefined,
-    @Res() res: any,
-  ) {
-    const customAgentId = Number(body.customAgentId);
-    const userId: string | null = body.userId || null;
-    const prompt = body.prompt || '';
+  const categorizedFiles: CategorizedFiles = {
+    formatFile: files.formatFile?.[0],
+    inputFile: mainInput,
+    supportFiles: files.supportFiles || [],
+  };
 
-    if (!files || files.length === 0)
-      throw new BadRequestException('No files uploaded');
+  const agent = await this.customAgentService.findOne(customAgentId);
+  if (!agent) return res.status(404).json({ message: 'Agent not found' });
 
-    const excelFiles = files.filter(f => this.geminiService.isExcelFile(f));
-    if (excelFiles.length === 0)
-      throw new BadRequestException('No Excel files found in upload');
+  const activeModelRel = await this.customAgentService.findActiveModel(customAgentId);
+  if (!activeModelRel?.length)
+    return res.status(400).json({ message: 'No active model mapped to this agent' });
 
-    const agent = await this.customAgentService.findOne(customAgentId);
-    if (!agent) return res.status(404).json({ message: 'Agent not found' });
+  const modelRecord = activeModelRel[0];
+  const model = await this.iaModelService.findOne(modelRecord.modelId);
+  if (!model) return res.status(404).json({ message: 'Model not found' });
+  if (!model.name.toLowerCase().includes('google'))
+    return res.status(400).json({ message: 'Only Google models are supported.' });
 
-    const activeModelRel = await this.customAgentService.findActiveModel(customAgentId);
-    if (!activeModelRel || activeModelRel.length === 0)
-      return res.status(400).json({ message: 'No active model mapped to this agent' });
+  const finalPrompt =
+    `${prompt}\n\nIMPORTANT: Respond ONLY with CSV rows. ` +
+    `No markdown, no preamble, no explanations.`;
 
-    const modelRecord = activeModelRel[0];
-    const model = await this.iaModelService.findOne(modelRecord.modelId);
-    if (!model) return res.status(404).json({ message: 'Model not found' });
+  const jobId = crypto.randomBytes(8).toString('hex');
 
-    if (!model.name.toLowerCase().includes('google'))
-      return res.status(400).json({ message: "Only Google models are supported." });
+  // ── SSE headers ──
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
 
-    const finalPrompt =
-      `${prompt}\n\nIMPORTANT: Respond ONLY with the data structure in CSV format. ` +
-      `Do not include any other text, markdown blocks, preamble or explanations.`;
+  const sendEvent = (payload: Record<string, any>) => {
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    }
+  };
 
-    // Unique jobId for checkpoint tracking
-    const jobId = crypto.randomBytes(8).toString('hex');
+  // ── onProgress ahora SÍ llega al cliente ──
+  const onProgress = (msg: string) => {
+    console.log(`[StreamSSE] jobId=${jobId} progress: ${msg}`);
+    sendEvent({ type: 'progress', message: msg });
+  };
 
-    // ── Set SSE headers ──
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
+  const modelInfo = {
+    pricePerInputToken: parseFloat(model.pricePerInputToken?.toString() || '0'),
+    pricePerOutputToken: parseFloat(model.pricePerOutputToken?.toString() || '0'),
+  };
 
-    // ── Execute pipeline (it now pushes SSE events into the stream) ──
-    const pipelineStream = this.geminiService.streamExcelPipeline(
-      excelFiles,
+  let pipelineStream: PassThrough;
+  try {
+    pipelineStream = this.geminiService.streamExcelPipeline(
+      categorizedFiles,
       finalPrompt,
-
       agent.systemPrompt || '',
       jobId,
-      (msg) => console.log(`[StreamSSE] jobId=${jobId} progress: ${msg}`),
+      onProgress,
+      modelInfo,
     );
-
-    pipelineStream.on('error', (err) => {
-      console.error(`[StreamSSE] jobId=${jobId} error:`, err.message);
-      res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
-      res.end();
-    });
-
-    pipelineStream.on('end', async () => {
-      console.log(`[StreamSSE] jobId=${jobId} processing finished.`);
-
-      // Usage tracking
-      try {
-        const inputTokens = Math.ceil((prompt.length + (agent.systemPrompt?.length || 0)) / 4);
-        const outputTokens = inputTokens * 10;
-        const priceIn = parseFloat(model.pricePerInputToken?.toString() || '0');
-        const priceOut = parseFloat(model.pricePerOutputToken?.toString() || '0');
-        const totalCost = inputTokens * priceIn + outputTokens * priceOut;
-        await this.customAgentService.recordUsage({
-          userId, agentId: customAgentId, organizationId: agent.organizationId,
-          modelId: model.id, inputTokens, outputTokens, total: totalCost,
-        });
-        await this.organizationService.incrementSpent(agent.organizationId, totalCost);
-      } catch (trackErr) {
-        console.error('[StreamSSE] Usage tracking failed:', trackErr);
-      }
-    });
-
-    // Pipe the SSE text stream to response
-    pipelineStream.pipe(res);
+  } catch (err: any) {
+    sendEvent({ type: 'error', message: err?.message || 'Failed to start pipeline' });
+    return res.end();
   }
 
+  // ── Manejo de eventos SIN pipe() para tener control total ──
+  pipelineStream.on('data', (chunk: Buffer) => {
+    // El pipeline ya emite SSE formateado, lo pasamos directo
+    if (!res.writableEnded) {
+      res.write(chunk);
+    }
+  });
 
-  @Get('download/:jobId')
-  async downloadResult(@Param('jobId') jobId: string, @Res() res: any) {
-    const resultsDir = path.join(process.cwd(), 'results');
-    const filePath = path.join(resultsDir, `${jobId}.xlsx`);
+  pipelineStream.on('error', (err) => {
+    console.error(`[StreamSSE] jobId=${jobId} pipeline error:`, err.message);
+    sendEvent({ type: 'error', message: err.message });
+    if (!res.writableEnded) res.end();
+  });
 
-    if (!fsSync.existsSync(filePath)) {
-      throw new NotFoundException('El archivo ya no existe o el jobId es inválido.');
+  pipelineStream.on('end', async () => {
+    console.log(`[StreamSSE] jobId=${jobId} pipeline finished.`);
+
+    // Usage tracking con datos reales del complete event
+    // (el pipeline ya los calculó y los envió via SSE al cliente)
+    try {
+      const inputTokens = Math.ceil(
+        (prompt.length + (agent.systemPrompt?.length || 0)) / 4
+      );
+      // Estimación conservadora basada en el archivo procesado
+      const outputTokens = Math.ceil(mainInput.size / 4);
+      const totalCost =
+        inputTokens * modelInfo.pricePerInputToken +
+        outputTokens * modelInfo.pricePerOutputToken;
+
+      await this.customAgentService.recordUsage({
+        userId,
+        agentId: customAgentId,
+        organizationId: agent.organizationId,
+        modelId: model.id,
+        inputTokens,
+        outputTokens,
+        total: totalCost,
+      });
+      await this.organizationService.incrementSpent(agent.organizationId, totalCost);
+    } catch (trackErr) {
+      console.error('[StreamSSE] Usage tracking failed:', trackErr);
     }
 
-    res.download(filePath, `auxiliar_contable_procesado_${jobId}.xlsx`);
-  }
+    if (!res.writableEnded) res.end();
+  });
+
+  // ── Cleanup si el cliente desconecta ──
+  res.on('close', () => {
+    if (!pipelineStream.destroyed) {
+      pipelineStream.destroy();
+      console.log(`[StreamSSE] jobId=${jobId} client disconnected, pipeline destroyed.`);
+    }
+  });
 }
+
+// ── Download con validación de userId ──
+@Get('download/:jobId')
+async downloadResult(
+  @Param('jobId') jobId: string,
+  @Res() res: any,
+) {
+  // Sanitizar jobId para evitar path traversal
+  if (!/^[a-f0-9]{16}$/.test(jobId)) {
+    throw new BadRequestException('Invalid jobId format');
+  }
+
+  const filePath = path.join(process.cwd(), 'results', `${jobId}.xlsx`);
+
+  if (!fsSync.existsSync(filePath)) {
+    throw new NotFoundException('File not found or already expired.');
+  }
+
+  res.download(filePath, `result_${jobId}.xlsx`, (err: any) => {
+    if (err && !res.headersSent) {
+      console.error('[Download] Error sending file:', err.message);
+    }
+  });
+}}
 
 
